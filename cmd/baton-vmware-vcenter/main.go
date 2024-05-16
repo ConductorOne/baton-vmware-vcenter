@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 
 	"github.com/conductorone/baton-sdk/pkg/cli"
@@ -27,6 +28,7 @@ func main() {
 	}
 
 	cmd.Version = version
+	cmdFlags(cmd)
 
 	err = cmd.Execute()
 	if err != nil {
@@ -38,7 +40,13 @@ func main() {
 func getConnector(ctx context.Context, cfg *config) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	cb, err := connector.New(ctx)
+	u, err := url.Parse(cfg.VCenterServerURL)
+	if err != nil {
+		l.Error("error parsing vCenter server URL", zap.Error(err))
+		return nil, err
+	}
+
+	cb, err := connector.New(ctx, u, cfg.Insecure)
 	if err != nil {
 		l.Error("error creating connector", zap.Error(err))
 		return nil, err
