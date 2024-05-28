@@ -3,7 +3,7 @@ module github.com/conductorone/baton-vmware-vcenter
 go 1.22.2
 
 require (
-	github.com/conductorone/baton-sdk v0.1.34
+	github.com/conductorone/baton-sdk v0.1.38
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/spf13/cobra v1.8.0
 	github.com/vmware/govmomi v0.37.1

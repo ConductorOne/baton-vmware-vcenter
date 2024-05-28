@@ -7,6 +7,8 @@ import (
 	"reflect"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"go.uber.org/zap"
 )
 
 var (
@@ -169,7 +171,8 @@ func (g *EntitlementGraph) getAncestors(entitlementID string) []int {
 func (g *EntitlementGraph) GetCycles() ([][]int, bool) {
 	rv := make([][]int, 0)
 	for nodeID := range g.Nodes {
-		if len(g.getDescendants(nodeID)) == 0 {
+		edges, ok := g.Edges[nodeID]
+		if !ok || len(edges) == 0 {
 			continue
 		}
 		cycle, isCycle := g.getCycle([]int{nodeID})
@@ -202,10 +205,10 @@ func (g *EntitlementGraph) getCycle(visits []int) ([]int, bool) {
 		return nil, false
 	}
 	nodeId := visits[len(visits)-1]
-	for _, descendant := range g.getDescendants(nodeId) {
+	for descendantId := range g.Edges[nodeId] {
 		tempVisits := make([]int, len(visits))
 		copy(tempVisits, visits)
-		if descendant.Id == visits[0] {
+		if descendantId == visits[0] {
 			// shift array so that the smallest element is first
 			smallestIndex := 0
 			for i := range tempVisits {
@@ -217,28 +220,15 @@ func (g *EntitlementGraph) getCycle(visits []int) ([]int, bool) {
 			return tempVisits, true
 		}
 		for _, visit := range visits {
-			if visit == descendant.Id {
+			if visit == descendantId {
 				return nil, false
 			}
 		}
 
-		tempVisits = append(tempVisits, descendant.Id)
-		return g.getCycle(tempVisits) //nolint:staticcheck // false positive
+		tempVisits = append(tempVisits, descendantId)
+		return g.getCycle(tempVisits)
 	}
 	return nil, false
-}
-
-func (g *EntitlementGraph) getDescendants(nodeID int) []Node {
-	node, ok := g.Nodes[nodeID]
-	if !ok {
-		return nil
-	}
-	var nodes []Node
-	for dstNodeId := range g.Edges[node.Id] {
-		dstNode := g.Nodes[dstNodeId]
-		nodes = append(nodes, dstNode)
-	}
-	return nodes
 }
 
 func (g *EntitlementGraph) GetDescendantEntitlements(entitlementID string) map[string]*grantInfo {
@@ -312,7 +302,7 @@ func (g *EntitlementGraph) GetNode(entitlementId string) *Node {
 	return nil
 }
 
-func (g *EntitlementGraph) AddEdge(srcEntitlementID string, dstEntitlementID string, shallow bool, resourceTypeIDs []string) error {
+func (g *EntitlementGraph) AddEdge(ctx context.Context, srcEntitlementID string, dstEntitlementID string, shallow bool, resourceTypeIDs []string) error {
 	srcNode := g.GetNode(srcEntitlementID)
 	if srcNode == nil {
 		return ErrNoEntitlement
@@ -336,7 +326,14 @@ func (g *EntitlementGraph) AddEdge(srcEntitlementID string, dstEntitlementID str
 		}
 	} else {
 		// TODO: just do nothing? it's probably a mistake if we're adding the same edge twice
-		return fmt.Errorf("edge already exists")
+		ctxzap.Extract(ctx).Warn(
+			"duplicate edge from datasource",
+			zap.String("src_entitlement_id", srcEntitlementID),
+			zap.String("dst_entitlement_id", dstEntitlementID),
+			zap.Bool("shallow", shallow),
+			zap.Strings("resource_type_ids", resourceTypeIDs),
+		)
+		return nil
 	}
 	return nil
 }
@@ -386,11 +383,13 @@ func (g *EntitlementGraph) mergeNodes(node1ID int, node2ID int) {
 	g.removeNode(node2ID)
 }
 
-func (g *EntitlementGraph) FixCycles() {
-	for {
+func (g *EntitlementGraph) FixCycles() error {
+	// If we can't fix the cycles in 10 tries, just give up
+	const maxTries = 10
+	for i := 0; i < maxTries; i++ {
 		cycles, hasCycles := g.GetCycles()
 		if !hasCycles {
-			return
+			return nil
 		}
 
 		// Merge all the nodes in a cycle.
@@ -398,4 +397,5 @@ func (g *EntitlementGraph) FixCycles() {
 			g.mergeNodes(cycles[0][0], cycles[0][i])
 		}
 	}
+	return fmt.Errorf("could not fix cycles after %v tries", maxTries)
 }
