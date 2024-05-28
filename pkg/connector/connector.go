@@ -20,6 +20,7 @@ func (vc *VMwareVCenter) ResourceSyncers(ctx context.Context) []connectorbuilder
 	return []connectorbuilder.ResourceSyncer{
 		newUserBuilder(vc.client),
 		newRoleBuilder(vc.client),
+		newGroupBuilder(vc.client),
 	}
 }
 
