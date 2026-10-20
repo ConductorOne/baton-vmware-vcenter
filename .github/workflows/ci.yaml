@@ -4,12 +4,12 @@ jobs:
   go-lint:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.27.x
-      - name: Checkout code
-        uses: actions/checkout@v4
+          go-version-file: go.mod
       - name: Run linters
         uses: golangci/golangci-lint-action@v5
         with:
@@ -18,17 +18,16 @@ jobs:
   go-test:
     strategy:
       matrix:
-        go-version: [1.27.x]
         platform: [ubuntu-latest]
     runs-on: ${{ matrix.platform }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Install Go
         if: success()
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
-      - name: Checkout code
-        uses: actions/checkout@v4
+          go-version-file: go.mod
       - name: go tests
         run: go test -v -covermode=count -json ./... > test.json
       - name: annotate go tests
@@ -59,10 +58,6 @@ jobs:
       CONNECTOR_PRINCIPAL: 'user:9876'
       CONNECTOR_PRINCIPAL_TYPE: 'user'
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 1.27.x
       - name: Checkout code
         uses: actions/checkout@v4
       # Install any dependencies here (or delete this)
@@ -73,6 +68,10 @@ jobs:
       #   run: psql -h localhost --user postgres -f environment.sql
       #   env:
       #     PGPASSWORD: secretpassword
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: Build baton-vmware-vcenter
         run: go build ./cmd/baton-vmware-vcenter
       - name: Run baton-vmware-vcenter
