@@ -1,8 +1,6 @@
 module github.com/conductorone/baton-vmware-vcenter
 
-go 1.23
-
-toolchain go1.24.7
+go 1.27.3
 
 require (
 	github.com/conductorone/baton-sdk v0.1.38
