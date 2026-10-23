@@ -5,12 +5,11 @@ import (
 	"fmt"
 
 	"github.com/doug-martin/goqu/v9"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"go.uber.org/zap"
-	"google.golang.org/protobuf/proto"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
+	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
 const entitlementsTableVersion = "1"
@@ -50,65 +49,84 @@ func (r *entitlementsTable) Schema() (string, []interface{}) {
 	}
 }
 
+func (r *entitlementsTable) Migrations(ctx context.Context, db *goqu.Database) (bool, error) {
+	return false, nil
+}
+
 func (c *C1File) ListEntitlements(ctx context.Context, request *v2.EntitlementsServiceListEntitlementsRequest) (*v2.EntitlementsServiceListEntitlementsResponse, error) {
-	ctxzap.Extract(ctx).Debug("listing entitlements")
-	objs, nextPageToken, err := c.listConnectorObjects(ctx, entitlements.Name(), request)
+	ctx, span := tracer.Start(ctx, "C1File.ListEntitlements")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+
+	objs, nextPageToken, err := listConnectorObjects(ctx, c, entitlements.Name(), request, func() *v2.Entitlement { return &v2.Entitlement{} })
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error listing entitlements: %w", err)
 	}
 
-	ret := make([]*v2.Entitlement, 0, len(objs))
-	for _, o := range objs {
-		en := &v2.Entitlement{}
-		err = proto.Unmarshal(o, en)
-		if err != nil {
-			return nil, err
-		}
-		ret = append(ret, en)
-	}
-
-	return &v2.EntitlementsServiceListEntitlementsResponse{
-		List:          ret,
+	return v2.EntitlementsServiceListEntitlementsResponse_builder{
+		List:          objs,
 		NextPageToken: nextPageToken,
-	}, nil
+	}.Build(), nil
 }
 
 func (c *C1File) GetEntitlement(ctx context.Context, request *reader_v2.EntitlementsReaderServiceGetEntitlementRequest) (*reader_v2.EntitlementsReaderServiceGetEntitlementResponse, error) {
-	ctxzap.Extract(ctx).Debug("fetching entitlement", zap.String("entitlement_id", request.EntitlementId))
+	ctx, span := tracer.Start(ctx, "C1File.GetEntitlement")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
 
 	ret := &v2.Entitlement{}
-
-	err := c.getConnectorObject(ctx, entitlements.Name(), request.EntitlementId, ret)
+	syncId, err := annotations.GetSyncIdFromAnnotations(request.GetAnnotations())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error getting sync id from annotations for entitlement '%s': %w", request.GetEntitlementId(), err)
+	}
+	err = c.getConnectorObject(ctx, entitlements.Name(), request.GetEntitlementId(), syncId, ret)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching entitlement '%s': %w", request.GetEntitlementId(), err)
 	}
 
-	return &reader_v2.EntitlementsReaderServiceGetEntitlementResponse{
+	return reader_v2.EntitlementsReaderServiceGetEntitlementResponse_builder{
 		Entitlement: ret,
-	}, nil
+	}.Build(), nil
 }
 
-func (c *C1File) PutEntitlement(ctx context.Context, entitlement *v2.Entitlement) error {
-	ctxzap.Extract(ctx).Debug("syncing entitlement", zap.String("entitlement_id", entitlement.Id))
+func (c *C1File) ListStaticEntitlements(ctx context.Context, request *v2.EntitlementsServiceListStaticEntitlementsRequest) (*v2.EntitlementsServiceListStaticEntitlementsResponse, error) {
+	_, span := tracer.Start(ctx, "C1File.ListStaticEntitlements")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
 
-	if entitlement.Resource == nil && entitlement.Resource.Id == nil {
-		return fmt.Errorf("entitlements must have a non-nil resource")
+	return v2.EntitlementsServiceListStaticEntitlementsResponse_builder{
+		List:          []*v2.Entitlement{},
+		NextPageToken: "",
+	}.Build(), nil
+}
+
+func (c *C1File) PutEntitlements(ctx context.Context, entitlementObjs ...*v2.Entitlement) error {
+	ctx, span := tracer.Start(ctx, "C1File.PutEntitlements")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+
+	return c.putEntitlementsInternal(ctx, bulkPutConnectorObject, entitlementObjs...)
+}
+
+type entitlementPutFunc func(context.Context, *C1File, string, func(m *v2.Entitlement) (goqu.Record, error), ...*v2.Entitlement) error
+
+func (c *C1File) putEntitlementsInternal(ctx context.Context, f entitlementPutFunc, entitlementObjs ...*v2.Entitlement) error {
+	if c.readOnly {
+		return ErrReadOnly
 	}
 
-	query, args, err := c.putConnectorObjectQuery(ctx, entitlements.Name(), entitlement, goqu.Record{
-		"resource_id":      entitlement.Resource.Id.Resource,
-		"resource_type_id": entitlement.Resource.Id.ResourceType,
-	})
+	err := f(ctx, c, entitlements.Name(),
+		func(entitlement *v2.Entitlement) (goqu.Record, error) {
+			return goqu.Record{
+				"resource_id":      entitlement.GetResource().GetId().GetResource(),
+				"resource_type_id": entitlement.GetResource().GetId().GetResourceType(),
+			}, nil
+		},
+		entitlementObjs...,
+	)
 	if err != nil {
 		return err
 	}
-
-	_, err = c.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-
-	c.dbUpdated = true
-
+	c.dbUpdated.Store(true)
 	return nil
 }
