@@ -1,4 +1,10 @@
-<p align="center"><img alt="The age logo, an wireframe of St. Peters dome in Rome, with the text: age, file encryption" width="600" src="https://user-images.githubusercontent.com/1225294/132245842-fda4da6a-1cea-4738-a3da-2dc860861c98.png"></p>
+<p align="center">
+    <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://github.com/FiloSottile/age/blob/main/logo/logo_white.svg">
+        <source media="(prefers-color-scheme: light)" srcset="https://github.com/FiloSottile/age/blob/main/logo/logo.svg">
+        <img alt="The age logo, a wireframe of St. Peters dome in Rome, with the text: age, file encryption" width="600" src="https://github.com/FiloSottile/age/blob/main/logo/logo.svg">
+    </picture>
+</p>
 
 [![Go Reference](https://pkg.go.dev/badge/filippo.io/age.svg)](https://pkg.go.dev/filippo.io/age)
 [![man page](<https://img.shields.io/badge/age(1)-man%20page-lightgrey>)](https://filippo.io/age/age.1)
@@ -6,7 +12,7 @@
 
 age is a simple, modern and secure file encryption tool, format, and Go library.
 
-It features small explicit keys, no config options, and UNIX-style composability.
+It features small explicit keys, post-quantum support, no config options, and UNIX-style composability.
 
 ```
 $ age-keygen -o key.txt
@@ -15,15 +21,17 @@ $ tar cvz ~/data | age -r age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9
 $ age --decrypt -i key.txt data.tar.gz.age > data.tar.gz
 ```
 
-📜 The format specification is at [age-encryption.org/v1](https://age-encryption.org/v1). age was designed by [@Benjojo12](https://twitter.com/Benjojo12) and [@FiloSottile](https://twitter.com/FiloSottile).
-
-📬 Follow the maintenance of this project by subscribing to [Maintainer Dispatches](https://filippo.io/newsletter)!
+📜 The format specification is at [age-encryption.org/v1](https://age-encryption.org/v1). age was designed by [@benjojo](https://github.com/benjojo) and [@FiloSottile](https://github.com/FiloSottile).
 
 🦀 An alternative interoperable Rust implementation is available at [github.com/str4d/rage](https://github.com/str4d/rage).
 
+🌍 [Typage](https://github.com/FiloSottile/typage) is a TypeScript implementation. It works in the browser, Node.js, Deno, and Bun.
+
 🔑 Hardware PIV tokens such as YubiKeys are supported through the [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey) plugin.
 
-💬 The author pronounces it `[aɡe̞]`, like the Italian [“aghe”](https://translate.google.com/?sl=it&text=aghe).
+✨ For more plugins, implementations, tools, and integrations, check out the [awesome age](https://github.com/FiloSottile/awesome-age) list.
+
+💬 The author pronounces it `[aɡe̞]` [with a hard *g*](https://translate.google.com/?sl=it&text=aghe), like GIF, and it's always spelled lowercase.
 
 ## Installation
 
@@ -41,6 +49,12 @@ $ age --decrypt -i key.txt data.tar.gz.age > data.tar.gz
         </td>
     </tr>
     <tr>
+        <td>Windows</td>
+        <td>
+            <code>winget install --id FiloSottile.age</code>
+        </td>
+    </tr>
+    <tr>
         <td>Alpine Linux v3.15+</td>
         <td>
             <code>apk add age</code>
@@ -53,7 +67,13 @@ $ age --decrypt -i key.txt data.tar.gz.age > data.tar.gz
         </td>
     </tr>
     <tr>
-        <td>Debian 11+ (Bullseye)</td>
+        <td>Debian 12+ (Bookworm)</td>
+        <td>
+            <code>apt install age</code>
+        </td>
+    </tr>
+    <tr>
+        <td>Debian 11 (Bullseye)</td>
         <td>
             <code>apt install age/bullseye-backports</code>
             (<a href="https://backports.debian.org/Instructions/#index2h2">enable backports</a> for age v1.0.0+)
@@ -69,6 +89,12 @@ $ age --decrypt -i key.txt data.tar.gz.age > data.tar.gz
         <td>Gentoo Linux</td>
         <td>
             <code>emerge app-crypt/age</code>
+        </td>
+    </tr>
+    <tr>
+        <td>Guix System</td>
+        <td>
+            <code>guix package -i age</code>
         </td>
     </tr>
     <tr>
@@ -116,7 +142,7 @@ $ age --decrypt -i key.txt data.tar.gz.age > data.tar.gz
     <tr>
         <td>Scoop (Windows)</td>
         <td>
-            <code>scoop bucket add extras; scoop install age</code>
+            <code>scoop bucket add extras && scoop install age</code>
         </td>
     </tr>
 </table>
@@ -125,9 +151,11 @@ On Windows, Linux, macOS, and FreeBSD you can use the pre-built binaries.
 
 ```
 https://dl.filippo.io/age/latest?for=linux/amd64
-https://dl.filippo.io/age/v1.0.0-rc.1?for=darwin/arm64
+https://dl.filippo.io/age/v1.3.0?for=darwin/arm64
 ...
 ```
+
+If you download the pre-built binaries, you can check their [Sigsum proofs](./SIGSUM.md).
 
 If your system has [a supported version of Go](https://go.dev/dl/), you can build from source.
 
@@ -201,6 +229,28 @@ $ age -R recipients.txt example.jpg > example.jpg.age
 
 If the argument to `-R` (or `-i`) is `-`, the file is read from standard input.
 
+### Post-quantum keys
+
+To generate hybrid post-quantum keys, which are secure against future quantum
+computer attacks, use the `-pq` flag with `age-keygen`. This may become the
+default in the future.
+
+Post-quantum identities start with `AGE-SECRET-KEY-PQ-1...` and recipients with
+`age1pq1...`. The recipients are unfortunately ~2000 characters long.
+
+```
+$ age-keygen -pq -o key.txt
+$ age-keygen -y key.txt > recipient.txt
+$ age -R recipient.txt example.jpg > example.jpg.age
+$ age -d -i key.txt example.jpg.age > example.jpg
+```
+
+Support for post-quantum keys is built into age v1.3.0 and later. Alternatively,
+the `age-plugin-pq` binary can be installed and placed in `$PATH` to add support
+to any version and implementation of age that supports plugins. Recipients will
+work out of the box, while identities will have to be converted to plugin
+identities with `age-plugin-pq -identity`.
+
 ### Passphrases
 
 Files can be encrypted with a passphrase by using `-p/--passphrase`. By default age will automatically generate a secure passphrase. Passphrase protected files are automatically detected at decrypt time.
@@ -249,3 +299,28 @@ $ curl https://github.com/benjojo.keys | age -R - example.jpg > example.jpg.age
 ```
 
 Keep in mind that people might not protect SSH keys long-term, since they are revokable when used only for authentication, and that SSH keys held on YubiKeys can't be used to decrypt files.
+
+### Inspecting encrypted files
+
+The `age-inspect` command can display metadata about an encrypted file without decrypting it, including the recipient types, whether it uses post-quantum encryption, and the payload size.
+
+```
+$ age-inspect secrets.age
+secrets.age is an age file, version "age-encryption.org/v1".
+
+This file is encrypted to the following recipient types:
+  - "mlkem768x25519"
+
+This file uses post-quantum encryption.
+
+Size breakdown (assuming it decrypts successfully):
+
+    Header                      1627 bytes
+    Encryption overhead           32 bytes
+    Payload                       42 bytes
+                        -------------------
+    Total                       1701 bytes
+
+```
+
+For scripting, use `--json` to get machine-readable output.
