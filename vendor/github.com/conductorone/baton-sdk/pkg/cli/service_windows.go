@@ -9,20 +9,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/conductorone/baton-sdk/pkg/logging"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 	"gopkg.in/yaml.v2"
+
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"github.com/spf13/cobra"
+
+	"github.com/conductorone/baton-sdk/pkg/field"
+	"github.com/conductorone/baton-sdk/pkg/logging"
 )
 
 const (
@@ -62,12 +64,6 @@ var skipServiceSetupFields = map[string]struct{}{
 	"RevokeGrantID":      {},
 }
 
-var (
-	stringReflectType      = reflect.TypeOf("")
-	boolReflectType        = reflect.TypeOf(true)
-	stringSliceReflectType = reflect.TypeOf([]string(nil))
-)
-
 func getExePath() (string, error) {
 	p, err := filepath.Abs(os.Args[0])
 	if err != nil {
@@ -96,13 +92,116 @@ func getExePath() (string, error) {
 	return p, err
 }
 
+const defaultEventLogID uint32 = 1
+const windowsEventIDKey = "event_id"
+
+// eventLogCore writes zap log entries to the Windows Event Log with level-appropriate event types.
+type eventLogCore struct {
+	zapcore.LevelEnabler
+	enc  zapcore.Encoder
+	elog *eventlog.Log
+}
+
+var _ zapcore.Core = (*eventLogCore)(nil)
+
+func newEventLogCore(elog *eventlog.Log, cfg zap.Config) zapcore.Core {
+	return &eventLogCore{
+		LevelEnabler: cfg.Level,
+		enc:          zapcore.NewConsoleEncoder(cfg.EncoderConfig),
+		elog:         elog,
+	}
+}
+
+func (c *eventLogCore) With(fields []zapcore.Field) zapcore.Core {
+	clone := c.clone()
+	for i := range fields {
+		fields[i].AddTo(clone.enc)
+	}
+	return clone
+}
+
+func (c *eventLogCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if c.Enabled(ent.Level) {
+		return ce.AddCore(ent, c)
+	}
+	return ce
+}
+
+func (c *eventLogCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
+	buf, err := c.enc.EncodeEntry(ent, fields)
+	if err != nil {
+		return err
+	}
+	msg := buf.String()
+	buf.Free()
+
+	// If a log message has an event ID, use it. Otherwise, use the default.
+	eventID := defaultEventLogID
+	for _, field := range fields {
+		if field.Key == windowsEventIDKey && field.Integer != 0 {
+			eventID = uint32(field.Integer)
+			break
+		}
+	}
+
+	switch {
+	case ent.Level >= zapcore.ErrorLevel:
+		err = c.elog.Error(eventID, msg)
+	case ent.Level >= zapcore.WarnLevel:
+		err = c.elog.Warning(eventID, msg)
+	default:
+		err = c.elog.Info(eventID, msg)
+	}
+	if err != nil {
+		return err
+	}
+	if ent.Level > zapcore.ErrorLevel {
+		// Sync the event log to ensure the message is written.
+		err = c.Sync()
+	}
+	return err
+}
+
+func (c *eventLogCore) Sync() error {
+	return nil
+}
+
+func (c *eventLogCore) clone() *eventLogCore {
+	return &eventLogCore{
+		LevelEnabler: c.LevelEnabler,
+		enc:          c.enc.Clone(),
+		elog:         c.elog,
+	}
+}
+
+type eventLogKey struct{}
+
 func initLogger(ctx context.Context, name string, loggingOpts ...logging.Option) (context.Context, error) {
+	logToEventLog, _ := ctx.Value(eventLogEnabledKey{}).(bool)
+
 	if isService() {
-		loggingOpts = []logging.Option{
+		defaultLoggingOpts := []logging.Option{
 			logging.WithLogFormat(logging.LogFormatJSON),
 			logging.WithLogLevel("info"),
-			logging.WithOutputPaths([]string{filepath.Join(getConfigDir(name), "baton.log")}),
 		}
+		if !logToEventLog {
+			// On Windows, stdout/stderr on services goes nowhere. Log to a file by default.
+			defaultLoggingOpts = append(defaultLoggingOpts, logging.WithOutputPaths([]string{filepath.Join(getConfigDir(name), "baton.log")}))
+		}
+		loggingOpts = append(defaultLoggingOpts, loggingOpts...)
+	}
+
+	if logToEventLog {
+		elog, err := eventlog.Open(name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open event log: %w", err)
+		}
+
+		// Put the event log on the context so we can reuse it in runService.
+		ctx = context.WithValue(ctx, eventLogKey{}, elog)
+		return logging.InitWithCore(ctx, func(cfg zap.Config) zapcore.Core {
+			return newEventLogCore(elog, cfg)
+		}, loggingOpts...)
 	}
 
 	return logging.Init(ctx, loggingOpts...)
@@ -178,7 +277,7 @@ func stopCmd(name string) *cobra.Command {
 					l.Error("Failed to stop service within 10 seconds.", zap.Error(err))
 					return changeCtx.Err()
 
-				case <-time.After(300 * time.Millisecond):
+				case <-time.After(1 * time.Second):
 					status, err = s.Query()
 					if err != nil {
 						l.Error("Failed to query service status.", zap.Error(err))
@@ -258,6 +357,7 @@ func getWindowsService(ctx context.Context, name string) (*mgr.Service, func(), 
 		l.Error("Failed to connect to service manager.", zap.Error(err))
 		return nil, func() {}, err
 	}
+	l.Debug("Connected to service manager.")
 
 	s, err := m.OpenService(name)
 	if err != nil {
@@ -265,6 +365,7 @@ func getWindowsService(ctx context.Context, name string) (*mgr.Service, func(), 
 		l.Error("Failed to open service.", zap.Error(err))
 		return nil, func() {}, err
 	}
+	l.Debug("Opened service.", zap.String("service_name", name))
 
 	return s, func() {
 		s.Close()
@@ -272,48 +373,60 @@ func getWindowsService(ctx context.Context, name string) (*mgr.Service, func(), 
 	}, nil
 }
 
-func interactiveSetup[T any, PtrT *T](ctx context.Context, outputFilePath string, cfg PtrT) error {
+func interactiveSetup(ctx context.Context, outputFilePath string, fields []field.SchemaField) error {
 	l := ctxzap.Extract(ctx)
 
-	var ret []reflect.StructField
-	fields := reflect.VisibleFields(reflect.TypeOf(*cfg))
-	for _, field := range fields {
-		if _, ok := skipServiceSetupFields[field.Name]; !ok {
-			ret = append(ret, field)
-		}
-	}
-
 	config := make(map[string]interface{})
-	for _, field := range ret {
-		var input string
-		cfgField := field.Tag.Get("mapstructure")
-		if cfgField == "" {
-			return fmt.Errorf("mapstructure tag is required on config field %s", field.Name)
+	for _, vfield := range fields {
+		if vfield.GetName() == "" {
+			return fmt.Errorf("field has no name")
 		}
 
-		fmt.Printf("Enter %s: ", field.Name)
+		// ignore any fields from the default set, except client id and client secret
+		if field.IsFieldAmongDefaultList(vfield) && vfield.GetName() != "client-id" && vfield.GetName() != "client-secret" {
+			continue
+		}
+
+		var input string
+		fmt.Printf("Enter %s: ", vfield.GetName())
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			input = scanner.Text()
 			break
 		}
+		if scanner.Err() != nil {
+			return fmt.Errorf("failed to read stdin: %w", scanner.Err())
+		}
 
-		switch reflect.ValueOf(cfg).Elem().FieldByName(field.Name).Type() {
-		case stringReflectType:
-			config[cfgField] = input
+		if input == "" {
+			if vfield.Required {
+				return fmt.Errorf("required field '%s' cannot be empty", vfield.GetName())
+			}
+			continue
+		}
 
-		case boolReflectType:
+		switch vfield.Variant {
+		case field.BoolVariant:
 			b, err := strconv.ParseBool(input)
 			if err != nil {
 				return err
 			}
-			config[cfgField] = b
+			config[vfield.GetName()] = b
 
-		case stringSliceReflectType:
-			config[cfgField] = strings.Split(input, ",")
+		case field.StringVariant:
+			config[vfield.GetName()] = input
 
+		case field.IntVariant:
+			i, err := strconv.Atoi(input)
+			if err != nil {
+				return err
+			}
+
+			config[vfield.GetName()] = i
+
+			// TODO (shackra): add support for []string in SDK
 		default:
-			l.Error("Unsupported type for interactive config.", zap.String("type", field.Type.String()))
+			l.Error("Unsupported type for interactive config.", zap.String("type", string(vfield.Variant)))
 			return errors.New("unsupported type for interactive config")
 		}
 	}
@@ -337,64 +450,74 @@ func interactiveSetup[T any, PtrT *T](ctx context.Context, outputFilePath string
 		l.Error("Failed to create config file.", zap.Error(err))
 		return err
 	}
-	defer f.Close()
+	fClosed := false
+	defer func() {
+		if !fClosed {
+			_ = f.Close()
+		}
+	}()
 
 	err = yaml.NewEncoder(f).Encode(config)
 	if err != nil {
 		return err
 	}
 
+	// Sync + Close + err-check before logging success. Without this
+	// the deferred Close would silently discard any write-back error
+	// (out-of-disk, IO error) and the user would see "Config file
+	// created." for a torn config they then try to load.
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync config file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close config file: %w", err)
+	}
+	fClosed = true
+
 	l.Info("Config file created.", zap.String("path", outputFilePath))
 
 	return nil
 }
 
-func installCmd[T any, PtrT *T](name string, cfg PtrT) *cobra.Command {
+func installCmd(name string, fields []field.SchemaField) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: fmt.Sprintf("Setup and configure the %s service", name),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, err := initLogger(
-				context.Background(),
-				name,
-				logging.WithLogFormat(logging.LogFormatConsole),
-				logging.WithLogLevel("info"),
-			)
-
+			ctx, err := initLogger(context.Background(), name, logging.WithLogFormat(logging.LogFormatConsole), logging.WithLogLevel("info"))
 			l := ctxzap.Extract(ctx)
-
 			svcMgr, err := mgr.Connect()
 			if err != nil {
 				l.Error("Failed to connect to service manager.", zap.Error(err))
 				return err
 			}
 			defer svcMgr.Disconnect()
-
 			s, err := svcMgr.OpenService(name)
 			if err == nil {
 				s.Close()
 				return fmt.Errorf("%s is already installed as a service. Please run '%s remove' to remove it first.", name, os.Args[0])
 			}
-
-			err = interactiveSetup(ctx, filepath.Join(getConfigDir(name), defaultConfigFile), cfg)
+			err = interactiveSetup(ctx, filepath.Join(getConfigDir(name), defaultConfigFile), fields)
 			if err != nil {
 				l.Error("Failed to setup service.", zap.Error(err))
 				return err
 			}
-
 			exePath, err := getExePath()
 			if err != nil {
 				l.Error("Failed to get executable path.", zap.Error(err))
 				return err
 			}
-
-			s, err = svcMgr.CreateService(name, exePath, mgr.Config{DisplayName: name})
+			mgrCfg := mgr.Config{
+				DisplayName:    name,
+				Description:    fmt.Sprintf("ConductorOne %s service", name),
+				BinaryPathName: exePath,
+			}
+			s, err = svcMgr.CreateService(name, exePath, mgrCfg)
 			if err != nil {
 				l.Error("Failed to create service.", zap.Error(err), zap.String("service_name", name))
 				return err
 			}
 			defer s.Close()
-
 			err = eventlog.InstallAsEventCreate(name, eventlog.Error|eventlog.Warning|eventlog.Info)
 			if err != nil {
 				l.Error("Failed to install event log source.", zap.Error(err))
@@ -405,7 +528,6 @@ func installCmd[T any, PtrT *T](name string, cfg PtrT) *cobra.Command {
 				}
 				return err
 			}
-
 			l.Info("Successfully installed service.", zap.String("service_name", name))
 			return nil
 		},
@@ -460,73 +582,92 @@ func uninstallCmd(name string) *cobra.Command {
 }
 
 type batonService struct {
+	name string
 	ctx  context.Context
 	elog debug.Log
 }
 
 func (s *batonService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
+	ctx, err := initLogger(s.ctx, s.name, logging.WithLogFormat(logging.LogFormatConsole), logging.WithLogLevel("info"))
+	if err != nil {
+		s.elog.Error(1, fmt.Sprintf("Failed to initialize logger. %v", err))
+		return false, 1
+	}
+	l := ctxzap.Extract(ctx)
+	l.Info("Executing service.")
 	changes <- svc.Status{State: svc.StartPending}
-	s.elog.Info(1, "Starting service.")
+	s.elog.Info(1, fmt.Sprintf("Starting %s service.", s.name))
 
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
-	s.elog.Info(1, "Started service.")
+	s.elog.Info(1, fmt.Sprintf("Started %s service.", s.name))
 outer:
 	for {
 		select {
 		case <-s.ctx.Done():
-			s.elog.Info(1, "Service context done. Shutting down.")
+			l.Info("Service context done. Shutting down")
+			s.elog.Info(1, fmt.Sprintf("%s service context done. Shutting down.", s.name))
 			break outer
 		case c := <-r:
 			switch c.Cmd {
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				s.elog.Info(1, "Received stop/shutdown request. Stopping service.")
+				l.Info("Received stop/shutdown request. Stopping service.")
+				s.elog.Info(1, fmt.Sprintf("Received stop/shutdown request. Stopping %s service.", s.name))
 				break outer
 			default:
-				s.elog.Error(1, fmt.Sprintf("Unexpected control request #%d", c.Cmd))
+				s.elog.Error(1, fmt.Sprintf("Unexpected control request #%d", c))
 			}
 		}
 	}
 
+	l.Info("Service stopped.")
 	changes <- svc.Status{State: svc.StopPending}
-	s.elog.Info(1, "Service stopped.")
+	s.elog.Info(1, fmt.Sprintf("%s service stopped.", s.name))
 	return false, 0
 }
 
 func runService(ctx context.Context, name string) (context.Context, error) {
 	l := ctxzap.Extract(ctx)
-
 	l.Info("Running service.")
+
+	// The event log is only on the context when logging to it was requested
+	// via --log-event-log. Otherwise open it here for service state messages.
+	elog, ok := ctx.Value(eventLogKey{}).(debug.Log)
+	if !ok {
+		var err error
+		elog, err = eventlog.Open(name)
+		if err != nil {
+			l.Error("Failed to open event log.", zap.Error(err))
+			return ctx, err
+		}
+	}
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	go func() {
 		defer cancel(nil)
 
-		elog, err := eventlog.Open(name)
-		if err != nil {
-			l.Error("Failed to open event log.", zap.Error(err))
-		}
-		defer elog.Close()
-
-		err = svc.Run(name, &batonService{
+		err := svc.Run(name, &batonService{
+			name: name,
 			ctx:  ctx,
 			elog: elog,
 		})
 		if err != nil {
-			l.Error("Service failed.", zap.Error(err))
+			elog.Error(1, fmt.Sprintf("Running %v service failed. %v", name, err))
+		} else {
+			elog.Info(1, fmt.Sprintf("%v service is running.", name))
 		}
 	}()
 
 	return ctx, nil
 }
 
-func additionalCommands[T any, PtrT *T](connectorName string, cfg PtrT) []*cobra.Command {
+func AdditionalCommands(connectorName string, fields []field.SchemaField) []*cobra.Command {
 	return []*cobra.Command{
 		startCmd(connectorName),
 		stopCmd(connectorName),
 		statusCmd(connectorName),
-		installCmd(connectorName, cfg),
+		installCmd(connectorName, fields),
 		uninstallCmd(connectorName),
 	}
 }

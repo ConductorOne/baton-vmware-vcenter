@@ -37,9 +37,8 @@ func roleResource(role *types.AuthorizationRole) (*v2.Resource, error) {
 		role.Name,
 		roleResourceType,
 		roleID,
-		[]rs.RoleTraitOption{
-			rs.WithRoleProfile(profile),
-		},
+		nil,
+		rs.WithResourceProfile(profile),
 		rs.WithDescription(role.Info.GetDescription().Summary),
 	)
 	if err != nil {
@@ -86,13 +85,7 @@ func (r *roleBuilder) Entitlements(ctx context.Context, resource *v2.Resource, _
 	rv = append(rv, ent.NewAssignmentEntitlement(resource, RoleMembershipEntitlement, aOptions...))
 
 	// add permission entitlements for all privileges in the role
-	roleTrait, err := rs.GetRoleTrait(resource)
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to get role trait: %w", err)
-	}
-
-	// parse privileges from role trait
-	privilegesPayload, ok := rs.GetProfileStringValue(roleTrait.Profile, "privileges")
+	privilegesPayload, ok := rs.GetProfileStringValue(resource.GetProfile(), "privileges")
 	if !ok {
 		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to get role trait privileges")
 	}
@@ -126,13 +119,8 @@ func (r *roleBuilder) Grants(ctx context.Context, resource *v2.Resource, pToken 
 		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to list permissions for role %s: %w", resource.DisplayName, err)
 	}
 
-	roleTrait, err := rs.GetRoleTrait(resource)
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to get role trait: %w", err)
-	}
-
-	// parse privileges from role trait to make grant expandable
-	privilegesPayload, ok := rs.GetProfileStringValue(roleTrait.Profile, "privileges")
+	// parse privileges from the role profile to make grant expandable
+	privilegesPayload, ok := rs.GetProfileStringValue(resource.GetProfile(), "privileges")
 	if !ok {
 		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to get role trait privileges")
 	}

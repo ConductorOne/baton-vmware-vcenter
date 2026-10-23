@@ -28,11 +28,11 @@ func userResource(user *types.AdminPersonUser) (*v2.Resource, error) {
 		"user_id":   user.Id.Name,
 	}
 
-	var status v2.UserTrait_Status_Status
+	var status v2.Status_ResourceStatus
 	if user.Disabled || user.Locked {
-		status = v2.UserTrait_Status_STATUS_DISABLED
+		status = v2.Status_RESOURCE_STATUS_DISABLED
 	} else {
-		status = v2.UserTrait_Status_STATUS_ENABLED
+		status = v2.Status_RESOURCE_STATUS_ENABLED
 	}
 
 	res, err := rs.NewUserResource(
@@ -41,9 +41,9 @@ func userResource(user *types.AdminPersonUser) (*v2.Resource, error) {
 		user.Id.Name,
 		[]rs.UserTraitOption{
 			rs.WithEmail(user.Details.EmailAddress, true),
-			rs.WithUserProfile(profile),
-			rs.WithStatus(status),
 		},
+		rs.WithResourceProfile(profile),
+		rs.WithResourceStatus(status, ""),
 	)
 	if err != nil {
 		return nil, err

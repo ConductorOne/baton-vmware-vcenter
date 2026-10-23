@@ -12,6 +12,7 @@ import (
 	v1 "github.com/conductorone/baton-sdk/pb/c1/connectorapi/baton/v1"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/types"
+	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
 type createTicketTaskHelpers interface {
@@ -25,26 +26,34 @@ type createTicketTaskHandler struct {
 }
 
 func (c *createTicketTaskHandler) HandleTask(ctx context.Context) error {
+	ctx, span := tracer.Start(ctx, "createTicketTaskHandler.HandleTask")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
 	l := ctxzap.Extract(ctx)
 
 	t := c.task.GetCreateTicketTask()
 	if t == nil || t.GetTicketRequest() == nil {
-		l.Error("create ticket task was nil or missing ticket request", zap.Any("create_resource_task", t))
-		return c.helpers.FinishTask(ctx, nil, nil, errors.Join(errors.New("malformed create ticket task"), ErrTaskNonRetryable))
+		l.Error("create ticket task was nil or missing ticket request", zap.Any("create_ticket_task", t))
+		return c.helpers.FinishTask(ctx, nil, t.GetAnnotations(), errors.Join(errors.New("malformed create ticket task"), ErrTaskNonRetryable))
 	}
 
 	cc := c.helpers.ConnectorClient()
-	resp, err := cc.CreateTicket(ctx, &v2.TicketsServiceCreateTicketRequest{
+	resp, err := cc.CreateTicket(ctx, v2.TicketsServiceCreateTicketRequest_builder{
 		Request:     t.GetTicketRequest(),
 		Schema:      t.GetTicketSchema(),
 		Annotations: t.GetAnnotations(),
-	})
+	}.Build())
 	if err != nil {
 		l.Error("failed creating ticket", zap.Error(err))
-		return c.helpers.FinishTask(ctx, nil, nil, errors.Join(err, ErrTaskNonRetryable))
+		return c.helpers.FinishTask(ctx, nil, t.GetAnnotations(), err)
 	}
 
-	return c.helpers.FinishTask(ctx, resp, resp.GetAnnotations(), nil)
+	respAnnos := annotations.Annotations(resp.GetAnnotations())
+	respAnnos.Merge(t.GetAnnotations()...)
+
+	resp.SetAnnotations(respAnnos)
+
+	return c.helpers.FinishTask(ctx, resp, respAnnos, nil)
 }
 
 func newCreateTicketTaskHandler(task *v1.Task, helpers createTicketTaskHelpers) *createTicketTaskHandler {

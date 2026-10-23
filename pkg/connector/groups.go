@@ -34,9 +34,8 @@ func groupResource(group *types.AdminGroup) (*v2.Resource, error) {
 		group.Id.Name,
 		groupResourceType,
 		group.Id.Name,
-		[]rs.GroupTraitOption{
-			rs.WithGroupProfile(profile),
-		},
+		nil,
+		rs.WithResourceProfile(profile),
 		rs.WithDescription(group.Details.Description),
 	)
 	if err != nil {

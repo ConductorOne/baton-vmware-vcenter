@@ -1,495 +1,431 @@
 package cli
 
 import (
-	"bufio"
+	"bytes"
 	"context"
-	"encoding/base64"
+	"encoding/csv"
 	"fmt"
-	"os"
+	"reflect"
+	"strings"
+	"sync"
 
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"github.com/spf13/cobra"
-	"go.uber.org/zap"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/anypb"
-
-	"github.com/conductorone/baton-sdk/internal/connector"
-	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
-	v1 "github.com/conductorone/baton-sdk/pb/c1/connector_wrapper/v1"
-	"github.com/conductorone/baton-sdk/pkg/connectorrunner"
-	"github.com/conductorone/baton-sdk/pkg/logging"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/field"
 	"github.com/conductorone/baton-sdk/pkg/types"
+	"github.com/conductorone/baton-sdk/pkg/types/sessions"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+	"golang.org/x/oauth2"
 )
 
-const (
-	envPrefix        = "baton"
-	defaultLogLevel  = "info"
-	defaultLogFormat = logging.LogFormatJSON
-)
+type RunTimeOpts struct {
+	SessionStore        sessions.SessionStore
+	TokenSource         oauth2.TokenSource
+	SelectedAuthMethod  string
+	SyncResourceTypeIDs []string
+	// EgressPolicy carries the server-computed egress policy delivered on the
+	// connector-config response, when one is present. It is nil for connectors
+	// served without a policy envelope; the connector decides how (and whether)
+	// to enforce it.
+	EgressPolicy *EgressPolicy
+}
 
-// NewCmd returns a new cobra command that will populate the provided config object, validate it, and run the provided run function.
-func NewCmd[T any, PtrT *T](
-	ctx context.Context,
-	name string,
-	cfg PtrT,
-	validateF func(ctx context.Context, cfg PtrT) error,
-	getConnector func(ctx context.Context, cfg PtrT) (types.ConnectorServer, error),
-	opts ...connectorrunner.Option,
-) (*cobra.Command, error) {
-	err := setupService(name)
+// EgressPolicy is the connector-facing projection of a served-policy envelope's
+// egress section: the fields a connector runtime needs to enforce egress,
+// extracted after the SDK verified the envelope's binding to this response.
+// The envelope's digests, versions, and capability section are not surfaced —
+// they are the SDK's contract to verify, not the connector's.
+type EgressPolicy struct {
+	// AllowedHosts is the effective per-instance egress allowlist (canonical
+	// hostnames). A non-nil *EgressPolicy with empty AllowedHosts is a valid
+	// deny-all policy.
+	AllowedHosts []string
+	// HTTPSOnly reports whether the runtime must refuse non-https egress.
+	HTTPSOnly bool
+	// Enforce reports whether AllowedHosts is a deny-gate rather than an
+	// observed-and-reported allowlist. The wire carries an enum; narrowing it to
+	// a bool here keeps an unrecognized future posture from reaching a runtime
+	// that would have to guess at it — anything but an explicit enforce observes.
+	Enforce bool
+}
+
+// GetConnectorFunc is a function type that creates a connector instance.
+// It takes a context and configuration. The session cache constructor is retrieved from the context.
+type GetConnectorFunc[T field.Configurable] func(ctx context.Context, cfg T) (types.ConnectorServer, error)
+type GetConnectorFunc2[T field.Configurable] func(ctx context.Context, cfg T, runTimeOpts RunTimeOpts) (types.ConnectorServer, error)
+
+// WithSessionCache creates a session cache using the provided constructor and adds it to the context.
+func WithSessionCache(ctx context.Context, constructor sessions.SessionStoreConstructor) (context.Context, error) {
+	sessionCache, err := constructor(ctx)
 	if err != nil {
-		return nil, err
+		return ctx, fmt.Errorf("failed to create session cache: %w", err)
+	}
+	return context.WithValue(ctx, sessions.SessionStoreKey{}, sessionCache), nil
+}
+
+// ConnectorOpts holds runtime options passed to a connector at initialization time.
+type ConnectorOpts struct {
+	TokenSource        oauth2.TokenSource
+	SelectedAuthMethod string
+
+	// SyncResourceTypeIDs is the set of resource type IDs the user has requested
+	// to sync. An empty slice means "sync everything the connector advertises"
+	// (subject to OptInRequired{} annotations on resource types). A non-empty
+	// slice means "sync only these types; skip everything else." Connectors
+	// should prefer the helper methods (WillSyncResourceType,
+	// SyncFilterIsExplicit, SyncResourceTypeSet) over reading this slice
+	// directly.
+	SyncResourceTypeIDs []string
+
+	// EgressPolicy carries the server-computed egress policy delivered on the
+	// connector-config response, when one is present. It is nil for connectors
+	// served without a policy envelope; the connector decides how (and whether)
+	// to enforce it.
+	EgressPolicy *EgressPolicy
+
+	syncResourceTypeSetOnce sync.Once
+	syncResourceTypeSetVal  map[string]struct{}
+}
+
+// SyncFilterIsExplicit reports whether the user has explicitly narrowed the set
+// of resource types to sync. Returns false when SyncResourceTypeIDs is empty,
+// meaning "sync all types the connector advertises".
+func (o *ConnectorOpts) SyncFilterIsExplicit() bool {
+	return len(o.SyncResourceTypeIDs) > 0
+}
+
+// SyncResourceTypeSet returns the user's selection as a set for O(1) lookup,
+// or nil if no filter was specified (meaning all resource types should be
+// synced). The set is computed lazily on first call and cached for subsequent
+// calls.
+func (o *ConnectorOpts) SyncResourceTypeSet() map[string]struct{} {
+	if !o.SyncFilterIsExplicit() {
+		return nil
+	}
+	o.syncResourceTypeSetOnce.Do(func() {
+		s := make(map[string]struct{}, len(o.SyncResourceTypeIDs))
+		for _, id := range o.SyncResourceTypeIDs {
+			s[id] = struct{}{}
+		}
+		o.syncResourceTypeSetVal = s
+	})
+	return o.syncResourceTypeSetVal
+}
+
+// WillSyncResourceType reports whether the given resource type ID will be
+// synced under the current configuration. Returns true when the user has not
+// specified any filter (the "default to all" case).
+func (o *ConnectorOpts) WillSyncResourceType(resourceTypeID string) bool {
+	if !o.SyncFilterIsExplicit() {
+		return true
+	}
+	_, ok := o.SyncResourceTypeSet()[resourceTypeID]
+	return ok
+}
+
+type NewConnector[T field.Configurable] func(ctx context.Context, cfg T, opts *ConnectorOpts) (connectorbuilder.ConnectorBuilderV2, []connectorbuilder.Opt, error)
+
+func MakeGenericConfiguration[T field.Configurable](v *viper.Viper, opts ...field.DecodeHookOption) (T, error) {
+	// Create an instance of the struct type T using reflection
+	var config T // Create a zero-value instance of T
+
+	// Is it a *Viper?
+	if reflect.TypeOf(config) == reflect.TypeOf((*viper.Viper)(nil)) {
+		if t, ok := any(v).(T); ok {
+			return t, nil
+		}
+		return config, fmt.Errorf("cannot convert *viper.Viper to %T", config)
 	}
 
-	cmd := &cobra.Command{
-		Use:           name,
-		Short:         name,
-		SilenceErrors: true,
-		SilenceUsage:  true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			v, err := loadConfig(cmd, cfg)
-			if err != nil {
-				return err
-			}
+	// Unmarshal into the config struct with any decode hook options provided
+	err := v.Unmarshal(&config, viper.DecodeHook(field.ComposeDecodeHookFunc(opts...)))
+	if err != nil {
+		return config, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	return config, nil
+}
 
-			runCtx, err := initLogger(
-				ctx,
-				name,
-				logging.WithLogFormat(v.GetString("log-format")),
-				logging.WithLogLevel(v.GetString("log-level")),
-			)
-			if err != nil {
-				return err
-			}
+// NOTE(shackra): Set all values from Viper to the flags so...
+// that Cobra won't complain that a flag is missing in case we...
+// pass values through environment variables.
+func VisitFlags(cmd *cobra.Command, v *viper.Viper) {
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if !v.IsSet(f.Name) {
+			return
+		}
 
-			err = validateF(ctx, cfg)
-			if err != nil {
-				return err
-			}
-
-			l := ctxzap.Extract(runCtx)
-
-			if isService() {
-				runCtx, err = runService(runCtx, name)
-				if err != nil {
-					l.Error("error running service", zap.Error(err))
-					return err
+		// v.GetString() mangles non-scalar types: YAML arrays become "[a b c]"
+		// and maps become "map[k:v]". Use type-appropriate getters so that
+		// pflag receives a properly formatted value for Set().
+		switch f.Value.Type() {
+		case "stringSlice":
+			switch v.Get(f.Name).(type) {
+			case []interface{}, []string:
+				// From YAML/config file: viper parsed individual elements.
+				// CSV-encode so pflag's readAsCSV() preserves values that
+				// contain commas (e.g. LDAP DNs like "OU=X,DC=Y").
+				ss := v.GetStringSlice(f.Name)
+				if len(ss) > 0 {
+					var buf bytes.Buffer
+					w := csv.NewWriter(&buf)
+					_ = w.Write(ss)
+					w.Flush()
+					_ = cmd.Flags().Set(f.Name, strings.TrimSuffix(buf.String(), "\n"))
 				}
+			default:
+				// From env var or other string source: pass the raw string
+				// to pflag so it splits on commas as expected.
+				_ = cmd.Flags().Set(f.Name, v.GetString(f.Name))
 			}
-
-			c, err := getConnector(runCtx, cfg)
-			if err != nil {
-				return err
+		case "stringToString":
+			if hasNestedStringMapValue(v.Get(f.Name)) {
+				return
 			}
-
-			daemonMode := v.GetString("client-id") != "" || isService()
-			if daemonMode {
-				if v.GetString("client-id") == "" {
-					return fmt.Errorf("client-id is required in service mode")
+			sm := v.GetStringMapString(f.Name)
+			if len(sm) > 0 {
+				// pflag expects "key=value" CSV format.
+				pairs := make([]string, 0, len(sm))
+				for k, val := range sm {
+					pairs = append(pairs, k+"="+val)
 				}
-				if v.GetString("client-secret") == "" {
-					return fmt.Errorf("client-secret is required in service mode")
-				}
-				opts = append(opts, connectorrunner.WithClientCredentials(v.GetString("client-id"), v.GetString("client-secret")))
-			} else {
-				switch {
-				case v.GetString("grant-entitlement") != "":
-					opts = append(opts,
-						connectorrunner.WithProvisioningEnabled(),
-						connectorrunner.WithOnDemandGrant(
-							v.GetString("file"),
-							v.GetString("grant-entitlement"),
-							v.GetString("grant-principal"),
-							v.GetString("grant-principal-type"),
-						))
-				case v.GetString("revoke-grant") != "":
-					opts = append(opts,
-						connectorrunner.WithProvisioningEnabled(),
-						connectorrunner.WithOnDemandRevoke(
-							v.GetString("file"),
-							v.GetString("revoke-grant"),
-						))
-				case v.GetBool("event-feed"):
-					opts = append(opts, connectorrunner.WithOnDemandEventStream())
-				case v.GetString("create-account-login") != "":
-					opts = append(opts,
-						connectorrunner.WithProvisioningEnabled(),
-						connectorrunner.WithOnDemandCreateAccount(
-							v.GetString("file"),
-							v.GetString("create-account-login"),
-							v.GetString("create-account-email"),
-						))
-				case v.GetString("delete-resource") != "":
-					opts = append(opts,
-						connectorrunner.WithProvisioningEnabled(),
-						connectorrunner.WithOnDemandDeleteResource(
-							v.GetString("file"),
-							v.GetString("delete-resource"),
-							v.GetString("delete-resource-type"),
-						))
-				case v.GetString("rotate-credentials") != "":
-					opts = append(opts,
-						connectorrunner.WithProvisioningEnabled(),
-						connectorrunner.WithOnDemandRotateCredentials(
-							v.GetString("file"),
-							v.GetString("rotate-credentials"),
-							v.GetString("rotate-credentials-type"),
-						))
-				case v.GetBool("create-ticket"):
-					opts = append(opts,
-						connectorrunner.WithTicketingEnabled(),
-						connectorrunner.WithCreateTicket(v.GetString("ticket-template-path")))
-				case v.GetBool("list-ticket-schemas"):
-					opts = append(opts,
-						connectorrunner.WithTicketingEnabled(),
-						connectorrunner.WithListTicketSchemas())
-				case v.GetBool("get-ticket"):
-					opts = append(opts,
-						connectorrunner.WithTicketingEnabled(),
-						connectorrunner.WithGetTicket(v.GetString("ticket-id")))
-				default:
-					opts = append(opts, connectorrunner.WithOnDemandSync(v.GetString("file")))
-				}
+				_ = cmd.Flags().Set(f.Name, strings.Join(pairs, ","))
 			}
+		default:
+			_ = cmd.Flags().Set(f.Name, v.GetString(f.Name))
+		}
+	})
+}
 
-			if v.GetString("c1z-temp-dir") != "" {
-				c1zTmpDir := v.GetString("c1z-temp-dir")
-				if _, err := os.Stat(c1zTmpDir); os.IsNotExist(err) {
-					return fmt.Errorf("the specified c1z temp dir does not exist: %s", c1zTmpDir)
-				}
-				opts = append(opts, connectorrunner.WithTempDir(v.GetString("c1z-temp-dir")))
-			}
-
-			r, err := connectorrunner.NewConnectorRunner(runCtx, c, opts...)
-			if err != nil {
-				l.Error("error creating connector runner", zap.Error(err))
-				return err
-			}
-			defer r.Close(runCtx)
-
-			err = r.Run(runCtx)
-			if err != nil {
-				l.Error("error running connector", zap.Error(err))
-				return err
-			}
-
-			return nil
-		},
+func hasNestedStringMapValue(value any) bool {
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() || rv.Kind() != reflect.Map {
+		return false
 	}
 
-	grpcServerCmd := &cobra.Command{
-		Use:    "_connector-service",
-		Short:  "Start the connector service",
-		Hidden: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			v, err := loadConfig(cmd, cfg)
-			if err != nil {
-				return err
-			}
-
-			runCtx, err := initLogger(
-				ctx,
-				name,
-				logging.WithLogFormat(v.GetString("log-format")),
-				logging.WithLogLevel(v.GetString("log-level")),
-			)
-			if err != nil {
-				return err
-			}
-
-			err = validateF(runCtx, cfg)
-			if err != nil {
-				return err
-			}
-
-			c, err := getConnector(runCtx, cfg)
-			if err != nil {
-				return err
-			}
-
-			var copts []connector.Option
-
-			if v.GetBool("provisioning") {
-				copts = append(copts, connector.WithProvisioningEnabled())
-			}
-
-			if v.GetBool("ticketing") {
-				copts = append(copts, connector.WithTicketingEnabled())
-			}
-
-			switch {
-			case v.GetString("grant-entitlement") != "":
-				copts = append(copts, connector.WithProvisioningEnabled())
-			case v.GetString("revoke-grant") != "":
-				copts = append(copts, connector.WithProvisioningEnabled())
-			case v.GetString("create-account-login") != "" || v.GetString("create-account-email") != "":
-				copts = append(copts, connector.WithProvisioningEnabled())
-			case v.GetString("delete-resource") != "" || v.GetString("delete-resource-type") != "":
-				copts = append(copts, connector.WithProvisioningEnabled())
-			case v.GetString("rotate-credentials") != "" || v.GetString("rotate-credentials-type") != "":
-				copts = append(copts, connector.WithProvisioningEnabled())
-			case v.GetBool("create-ticket"):
-				copts = append(copts, connector.WithTicketingEnabled())
-			case v.GetBool("list-ticket-schemas"):
-				copts = append(copts, connector.WithTicketingEnabled())
-			case v.GetBool("get-ticket"):
-				copts = append(copts, connector.WithTicketingEnabled())
-			}
-
-			cw, err := connector.NewWrapper(runCtx, c, copts...)
-			if err != nil {
-				return err
-			}
-
-			var cfgStr string
-			scn := bufio.NewScanner(os.Stdin)
-			for scn.Scan() {
-				cfgStr = scn.Text()
+	for _, mapKey := range rv.MapKeys() {
+		mapValue := rv.MapIndex(mapKey)
+		for mapValue.IsValid() && mapValue.Kind() == reflect.Interface {
+			if mapValue.IsNil() {
 				break
 			}
-			cfgBytes, err := base64.StdEncoding.DecodeString(cfgStr)
+			mapValue = mapValue.Elem()
+		}
+		if !mapValue.IsValid() {
+			continue
+		}
+		kind := mapValue.Kind()
+		if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array || kind == reflect.Struct {
+			return true
+		}
+	}
+	return false
+}
+
+func AddCommand(mainCMD *cobra.Command, v *viper.Viper, schema *field.Configuration, subCMD *cobra.Command) (*cobra.Command, error) {
+	mainCMD.AddCommand(subCMD)
+	if schema != nil {
+		err := SetFlagsAndConstraints(subCMD, *schema)
+		if err != nil {
+			return nil, err
+		}
+	}
+	VisitFlags(subCMD, v)
+
+	return subCMD, nil
+}
+func SetFlagsAndConstraints(command *cobra.Command, schema field.Configuration) error {
+	// add options
+	for _, f := range schema.Fields {
+		switch f.Variant {
+		case field.BoolVariant:
+			value, err := field.GetDefaultValue[bool](f)
 			if err != nil {
-				return err
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					BoolP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					BoolP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+		case field.IntVariant:
+			value, err := field.GetDefaultValue[int](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					IntP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					IntP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+		case field.StringVariant:
+			value, err := field.GetDefaultValue[string](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					StringP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					StringP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
 			}
 
-			go func() {
-				in := make([]byte, 1)
-				_, err := os.Stdin.Read(in)
-				if err != nil {
-					os.Exit(0)
+		case field.StringSliceVariant:
+			value, err := field.GetDefaultValue[[]string](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					StringSliceP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					StringSliceP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+		case field.StringMapVariant:
+			value, err := field.GetDefaultValue[map[string]any](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			strMap := make(map[string]string)
+			for k, v := range *value {
+				switch val := v.(type) {
+				case string:
+					strMap[k] = val
+				case int:
+					strMap[k] = fmt.Sprintf("%d", val)
+				case bool:
+					strMap[k] = fmt.Sprintf("%v", val)
+				case float64:
+					strMap[k] = fmt.Sprintf("%g", val)
+				default:
+					strMap[k] = fmt.Sprintf("%v", val)
 				}
-			}()
-
-			if len(cfgBytes) == 0 {
-				return fmt.Errorf("unexpected empty input")
 			}
-
-			serverCfg := &v1.ServerConfig{}
-			err = proto.Unmarshal(cfgBytes, serverCfg)
-			if err != nil {
-				return err
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					StringToStringP(f.FieldName, f.GetCLIShortHand(), strMap, f.GetDescription())
+			} else {
+				command.Flags().
+					StringToStringP(f.FieldName, f.GetCLIShortHand(), strMap, f.GetDescription())
 			}
-
-			err = serverCfg.ValidateAll()
-			if err != nil {
-				return err
-			}
-
-			return cw.Run(runCtx, serverCfg)
-		},
-	}
-
-	capabilitiesCmd := &cobra.Command{
-		Use:   "capabilities",
-		Short: "Get connector capabilities",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			v, err := loadConfig(cmd, cfg)
-			if err != nil {
-				return err
-			}
-
-			runCtx, err := initLogger(
-				ctx,
-				name,
-				logging.WithLogFormat(v.GetString("log-format")),
-				logging.WithLogLevel(v.GetString("log-level")),
+		default:
+			return fmt.Errorf(
+				"field %s, %s is not yet supported",
+				f.FieldName,
+				f.Variant,
 			)
-			if err != nil {
-				return err
+		}
+
+		// mark hidden
+		if f.IsHidden() {
+			if f.IsPersistent() {
+				err := command.PersistentFlags().MarkHidden(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot hide persistent field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			} else {
+				err := command.Flags().MarkHidden(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot hide field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			}
+		}
+
+		// mark required
+		if f.Required && len(schema.FieldGroups) == 0 {
+			if f.Variant == field.BoolVariant {
+				return fmt.Errorf("requiring %s of type %s does not make sense", f.FieldName, f.Variant)
 			}
 
-			c, err := getConnector(runCtx, cfg)
-			if err != nil {
-				return err
+			if f.IsPersistent() {
+				err := command.MarkPersistentFlagRequired(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot require persistent field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			} else {
+				err := command.MarkFlagRequired(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot require field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
 			}
-
-			md, err := c.GetMetadata(runCtx, &v2.ConnectorServiceGetMetadataRequest{})
-			if err != nil {
-				return err
-			}
-
-			if md.Metadata.Capabilities == nil {
-				return fmt.Errorf("connector does not support capabilities")
-			}
-
-			protoMarshaller := protojson.MarshalOptions{
-				Multiline: true,
-				Indent:    "  ",
-			}
-
-			a := &anypb.Any{}
-			err = anypb.MarshalFrom(a, md.Metadata.Capabilities, proto.MarshalOptions{Deterministic: true})
-			if err != nil {
-				return err
-			}
-
-			outBytes, err := protoMarshaller.Marshal(a)
-			if err != nil {
-				return err
-			}
-
-			_, err = fmt.Fprint(os.Stdout, string(outBytes))
-			if err != nil {
-				return err
-			}
-
-			return nil
-		},
+		}
 	}
 
-	cmd.AddCommand(grpcServerCmd)
-	cmd.AddCommand(capabilitiesCmd)
-
-	// Flags for file management
-	cmd.PersistentFlags().String("c1z-temp-dir", "", "The directory to store temporary files in. It "+
-		"must exist, and write access is required. Defaults to the OS temporary directory. ($BATON_C1Z_TEMP_DIR)")
-	if err := cmd.PersistentFlags().MarkHidden("c1z-temp-dir"); err != nil {
-		return nil, err
+	// apply constrains
+	for _, constrain := range schema.Constraints {
+		switch constrain.Kind {
+		case field.MutuallyExclusive:
+			command.MarkFlagsMutuallyExclusive(listFieldConstrainsAsStrings(constrain)...)
+		case field.RequiredTogether:
+			command.MarkFlagsRequiredTogether(listFieldConstrainsAsStrings(constrain)...)
+		case field.AtLeastOne:
+			command.MarkFlagsOneRequired(listFieldConstrainsAsStrings(constrain)...)
+		case field.Dependents:
+			// do nothing
+		default:
+			return fmt.Errorf("invalid config")
+		}
 	}
 
-	// Flags for logging configuration
-	cmd.PersistentFlags().String("log-level", defaultLogLevel, "The log level: debug, info, warn, error ($BATON_LOG_LEVEL)")
-	cmd.PersistentFlags().String("log-format", defaultLogFormat, "The output format for logs: json, console ($BATON_LOG_FORMAT)")
+	return nil
+}
 
-	// Flags for direct syncing and provisioning
-	cmd.PersistentFlags().StringP("file", "f", "sync.c1z", "The path to the c1z file to sync with ($BATON_FILE)")
-
-	// TODO (ggreer): simplify command line flags. make one action and reuse entitlement, resource, etc.
-	// baton-connector --provision-action=grant --entitlement=entitlement_id --resource=resource_id --resource-type=resource_type
-	// baton-connector --provision-action=revoke --grant=grant_id
-	// baton-connector --provision-action=delete --resource-id=resource_id --resource-type=resource_type
-	// baton-connector --provision-action=create-account --login=login --email=email
-	// baton-connector --provision-action=rotate-credentials --resource-id=resource_id --resource-type=resource_type
-
-	cmd.PersistentFlags().String("grant-entitlement", "", "The id of the entitlement to grant to the supplied principal ($BATON_GRANT_ENTITLEMENT)")
-	cmd.PersistentFlags().String("grant-principal", "", "The id of the resource to grant the entitlement to ($BATON_GRANT_PRINCIPAL)")
-	cmd.PersistentFlags().String("grant-principal-type", "", "The resource type of the principal to grant the entitlement to ($BATON_GRANT_PRINCIPAL_TYPE)")
-	cmd.PersistentFlags().String("revoke-grant", "", "The grant to revoke ($BATON_REVOKE_GRANT)")
-	cmd.PersistentFlags().Bool("event-feed", false, "Read feed events to stdout ($BATON_EVENT_FEED)")
-	cmd.MarkFlagsRequiredTogether("grant-entitlement", "grant-principal", "grant-principal-type")
-
-	cmd.PersistentFlags().String("create-account-login", "", "The login of the account to create ($BATON_CREATE_ACCOUNT_LOGIN)")
-	cmd.PersistentFlags().String("create-account-email", "", "The email of the account to create ($BATON_CREATE_ACCOUNT_EMAIL)")
-
-	cmd.PersistentFlags().String("delete-resource", "", "The id of the resource to delete ($BATON_DELETE_RESOURCE)")
-	cmd.PersistentFlags().String("delete-resource-type", "", "The type of the resource to delete ($BATON_DELETE_RESOURCE_TYPE)")
-
-	cmd.PersistentFlags().String("rotate-credentials", "", "The id of the resource to rotate credentials on ($BATON_ROTATE_CREDENTIALS)")
-	cmd.PersistentFlags().String("rotate-credentials-type", "", "The type of the resource to rotate credentials on ($BATON_ROTATE_CREDENTIALS_TYPE)")
-
-	cmd.PersistentFlags().Bool("ticketing", false, "This must be set to enable ticketing support ($BATON_TICKETING)")
-	cmd.PersistentFlags().Bool("create-ticket", false, "Create ticket ($BATON_CREATE_TICKET)")
-	cmd.PersistentFlags().String("ticket-template-path", "", "A JSON file describing the ticket to create ($BATON_TICKET_TEMPLATE_PATH)")
-
-	cmd.PersistentFlags().Bool("list-ticket-schemas", false, "List ticket schemas ($BATON_LIST_SCHEMAS)")
-
-	cmd.PersistentFlags().Bool("get-ticket", false, "Get ticket ($BATON_GET_TICKET)")
-	cmd.PersistentFlags().String("ticket-id", "", "The ID of the ticket to get ($BATON_TICKET_ID)")
-
-	cmd.MarkFlagsMutuallyExclusive(
-		"grant-entitlement",
-		"revoke-grant",
-		"create-account-login",
-		"delete-resource",
-		"rotate-credentials",
-		"event-feed",
-		"create-ticket",
-		"get-ticket",
-		"list-ticket-schemas",
-	)
-	cmd.MarkFlagsMutuallyExclusive(
-		"grant-entitlement",
-		"revoke-grant",
-		"create-account-email",
-		"delete-resource-type",
-		"rotate-credentials-type",
-		"event-feed",
-		"create-ticket",
-		"get-ticket",
-		"list-ticket-schemas",
-	)
-	err = cmd.PersistentFlags().MarkHidden("grant-entitlement")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("grant-principal")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("grant-principal-type")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("revoke-grant")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("event-feed")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("create-ticket")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("ticket-template-path")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("list-ticket-schemas")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("get-ticket")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("ticket-id")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("create-account-login")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("create-account-email")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("delete-resource")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("delete-resource-type")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("rotate-credentials")
-	if err != nil {
-		return nil, err
-	}
-	err = cmd.PersistentFlags().MarkHidden("rotate-credentials-type")
-	if err != nil {
-		return nil, err
+func listFieldConstrainsAsStrings(constrains field.SchemaFieldRelationship) []string {
+	var fields []string
+	for _, v := range constrains.Fields {
+		fields = append(fields, v.FieldName)
 	}
 
-	// Flags for daemon mode
-	cmd.PersistentFlags().String("client-id", "", "The client ID used to authenticate with ConductorOne ($BATON_CLIENT_ID)")
-	cmd.PersistentFlags().String("client-secret", "", "The client secret used to authenticate with ConductorOne ($BATON_CLIENT_SECRET)")
-	cmd.PersistentFlags().BoolP("provisioning", "p", false, "This must be set in order for provisioning actions to be enabled. ($BATON_PROVISIONING)")
-	cmd.MarkFlagsRequiredTogether("client-id", "client-secret")
-	cmd.MarkFlagsMutuallyExclusive("file", "client-id")
-	cmd.MarkFlagsRequiredTogether("create-ticket", "ticket-template-path")
-	cmd.MarkFlagsRequiredTogether("get-ticket", "ticket-id")
-	// Add a hook for additional commands to be added to the root command.
-	// We use this for OS specific commands.
-	cmd.AddCommand(additionalCommands(name, cfg)...)
-
-	err = configToCmdFlags(cmd, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return cmd, nil
+	return fields
 }
