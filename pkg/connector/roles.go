@@ -119,28 +119,18 @@ func (r *roleBuilder) Grants(ctx context.Context, resource *v2.Resource, pToken 
 		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to list permissions for role %s: %w", resource.DisplayName, err)
 	}
 
-	// parse privileges from the role profile to make grant expandable
-	privilegesPayload, ok := rs.GetProfileStringValue(resource.GetProfile(), "privileges")
-	if !ok {
-		return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to get role trait privileges")
-	}
-	privileges := strings.Split(privilegesPayload, ",")
-
-	// prepare format of entitlements to be expanded
-	var entitlementIDs []string
-	for _, priv := range privileges {
-		entitlementIDs = append(entitlementIDs, fmt.Sprintf("role:%d:%s", roleID, priv))
-	}
-
 	var rv []*v2.Grant
 	for _, perm := range permissions {
 		var principalID *v2.ResourceId
+		var grantOpts []grant.GrantOption
 		var err error
 		if perm.Group {
 			principalID, err = rs.NewResourceID(groupResourceType, perm.Principal)
 
-			// add also format of group to expand this role to all members of group
-			entitlementIDs = append(entitlementIDs, fmt.Sprintf("group:%s:%s", perm.Principal, GroupMembershipEntitlement))
+			// the SDK only accepts expansion sources that are entitlements on the grant principal
+			grantOpts = append(grantOpts, grant.WithAnnotation(&v2.GrantExpandable{
+				EntitlementIds: []string{fmt.Sprintf("group:%s:%s", perm.Principal, GroupMembershipEntitlement)},
+			}))
 		} else {
 			principalID, err = rs.NewResourceID(userResourceType, perm.Principal)
 		}
@@ -149,12 +139,11 @@ func (r *roleBuilder) Grants(ctx context.Context, resource *v2.Resource, pToken 
 			return nil, "", nil, fmt.Errorf("vmware-vcenter-connector: failed to create principal resource id: %w", err)
 		}
 
-		// create grant for each permission
 		rv = append(rv, grant.NewGrant(
 			resource,
 			RoleMembershipEntitlement,
 			principalID,
-			grant.WithAnnotation(&v2.GrantExpandable{EntitlementIds: entitlementIDs}),
+			grantOpts...,
 		))
 	}
 

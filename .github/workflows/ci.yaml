@@ -42,66 +42,35 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # Define any services needed for the test suite (or delete this section)
-    # services:
-    #   postgres:
-    #     image: postgres:16
-    #     ports:
-    #       - "5432:5432"
-    #     env:
-    #       POSTGRES_PASSWORD: secretpassword
     env:
       BATON_LOG_LEVEL: debug
-      # Add any environment variables needed to run baton-vmware-vcenter
-      # BATON_BASE_URL: 'http://localhost:8080'
-      # BATON_ACCESS_TOKEN: 'secret_token'
-      # The following parameters are passed to grant/revoke commands
-      # Change these to the correct IDs for your test data
-      CONNECTOR_GRANT: 'grant:entitlement:group:1234:member:user:9876'
-      CONNECTOR_ENTITLEMENT: 'entitlement:group:1234:member'
-      CONNECTOR_PRINCIPAL: 'user:9876'
-      CONNECTOR_PRINCIPAL_TYPE: 'user'
+      BATON_VCENTER_SERVER_URL: 'https://user:pass@127.0.0.1:8989/sdk'
+      BATON_INSECURE: 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      # Install any dependencies here (or delete this)
-      # - name: Install postgres client
-      #   run: sudo apt install postgresql-client
-      # Run any fixture setup here (or delete this)
-      # - name: Import sql into postgres
-      #   run: psql -h localhost --user postgres -f environment.sql
-      #   env:
-      #     PGPASSWORD: secretpassword
       - name: Install Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Start vcsim
+        run: |
+          go install github.com/vmware/govmomi/vcsim@v0.37.1
+          nohup "$(go env GOPATH)/bin/vcsim" -l 127.0.0.1:8989 > vcsim.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sfk https://127.0.0.1:8989/about > /dev/null && exit 0
+            sleep 1
+          done
+          cat vcsim.log
+          exit 1
       - name: Build baton-vmware-vcenter
         run: go build ./cmd/baton-vmware-vcenter
       - name: Run baton-vmware-vcenter
         run: ./baton-vmware-vcenter
-
       - name: Install baton
-        run: ./scripts/get-baton.sh && mv baton /usr/local/bin
-
-      - name: Check for grant before revoking
-
-        run:
-          baton grants --entitlement="${{ env.CONNECTOR_ENTITLEMENT }}" --output-format=json | jq --exit-status ".grants[].principal.id.resource == \"${{ env.CONNECTOR_PRINCIPAL }}\""
-
-
-      - name: Revoke grants
-        run: ./baton-vmware-vcenter --revoke-grant="${{ env.CONNECTOR_GRANT }}"
-
-      - name: Check grant was revoked
-        run: ./baton-vmware-vcenter && baton grants --entitlement="${{ env.CONNECTOR_ENTITLEMENT }}" --output-format=json | jq --exit-status "if .grants then .grants[]?.principal.id.resource != \"${{ env.CONNECTOR_PRINCIPAL }}\" else . end"
-
-      - name: Grant entitlement
-        # Change the grant arguments to the correct IDs for your test data
-        run: ./baton-vmware-vcenter --grant-entitlement="${{ env.CONNECTOR_ENTITLEMENT }}" --grant-principal="${{ env.CONNECTOR_PRINCIPAL }}" --grant-principal-type="${{ env.CONNECTOR_PRINCIPAL_TYPE }}"
-
-      - name: Check grant was re-granted
-
-        run:
-          baton grants --entitlement="${{ env.CONNECTOR_ENTITLEMENT }}" --output-format=json | jq --exit-status ".grants[].principal.id.resource == \"${{ env.CONNECTOR_PRINCIPAL }}\""
-
+        uses: ConductorOne/github-workflows/actions/get-baton@v4
+      # vcsim's SSO search matches the connector's "*" literally, so no users or groups sync here.
+      - name: Check roles were synced
+        run: baton resources --resource-type=role --output-format=json | jq --exit-status '.resources | length > 0'
+      - name: Check role grants were synced
+        run: baton grants --entitlement="role:-1:member" --output-format=json | jq --exit-status '.grants | length > 0'
